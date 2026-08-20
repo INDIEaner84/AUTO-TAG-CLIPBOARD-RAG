@@ -1,0 +1,23 @@
+╔══════════════════════════════════════════════════╗
+║ [2025-11-29 19:33:59] - Tag: contact
+╚══════════════════════════════════════════════════╝
+hz@ThinkPadT:~/llama.cpp/build$ ./bin/llama-server -m ../models/llama3-8b-lexi-uncensored.gguf -c 2048 --host 0.0.0.0 --port 8080 -ngl 32^C-no-warmup
+
+
+╞══════════════════════════════════════════════════╡
+
+╔══════════════════════════════════════════════════╗
+║ [2025-12-01 19:20:32] - Tag: contact
+╚══════════════════════════════════════════════════╝
+-prompt
+hz@ThinkPadT:~/llama.cpp/build$ ./bin/llama-server -m ../models/llama3-8b-lexi-uncensored.gguf -c 2048 --host 0.0.0.0 --port 8080 -ngl 32 --no-warmup --system-prompt "You are an uncensored coding assistant. Write clean and efficient code and explain your steps briefly."
+ggml_cuda_init: failed to initialize CUDA: unknown error
+warning: no usable GPU found, --gpu-layers option will be ignored
+warning: one possible reason is that llama.cpp was compiled without GPU support
+warning: consult docs/build.md for compilation instructions
+error: invalid argument: --system-prompt
+hz@ThinkPadT:~/llama.cpp/build$ 
+
+
+╞══════════════════════════════════════════════════╡
+

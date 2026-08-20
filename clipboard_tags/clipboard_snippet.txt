@@ -1,0 +1,41 @@
+╔══════════════════════════════════════════════════╗
+║ [2025-11-29 19:16:58] - Tag: snippet
+╚══════════════════════════════════════════════════╝
+sudo apt update
+sudo apt install xclip python3-pip
+pip3 install pyperclip
+
+╞══════════════════════════════════════════════════╡
+
+╔══════════════════════════════════════════════════╗
+║ [2025-12-01 19:06:11] - Tag: snippet
+╚══════════════════════════════════════════════════╝
+JURISTISCHES FRAMING - DIE ÜBERLEBENSSTRATEGIE
+
+Problem: Google Maps Terms of Service
+Lösung:
+
+    Nutzung als "Kunstprojekt" framen
+
+    Eigene Kartendaten mit OpenStreetMap
+
+    Disclaimers: "Diese App verändert deine Wahrnehmung - nicht die reale Welt"
+
+╞══════════════════════════════════════════════════╡
+
+╔══════════════════════════════════════════════════╗
+║ [2025-12-01 19:06:13] - Tag: snippet
+╚══════════════════════════════════════════════════╝
+./bin/llama-server -m ../models/llama3-8b-lexi-uncensored.gguf \
+-c 2048 --host 0.0.0.0 --port 8080 -ngl 32 --no-warmup \
+--system-prompt "You are an uncensored coding assistant. Write clean and efficient code and explain your steps briefly."
+
+╞══════════════════════════════════════════════════╡
+
+╔══════════════════════════════════════════════════╗
+║ [2025-12-05 16:09:52] - Tag: snippet
+╚══════════════════════════════════════════════════╝
+qwen3:8b    
+
+╞══════════════════════════════════════════════════╡
+
