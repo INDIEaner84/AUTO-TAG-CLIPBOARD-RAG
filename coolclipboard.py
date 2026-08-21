@@ -16,7 +16,7 @@ BANNER = """\
 ╚══════════════════════════════════════════════════╝"""
 
 import sys, os, json, sqlite3, subprocess, threading, queue, time
-import hashlib, re, webbrowser, shutil, base64
+import hashlib, re, webbrowser, shutil, base64, importlib.util
 from datetime import datetime
 from pathlib import Path
 
@@ -77,11 +77,13 @@ PLUGIN_DIR = DATA_DIR / 'plugins'
 DEFAULT_CONFIG = {
     'hotkey_overlay': '<cmd>+v',
     'hotkey_display': '<cmd>+h',
+    'web_host': '0.0.0.0',
     'web_port': 8234,
     'poll_interval': 0.5,
     'max_overlay': 50,
     'theme': 'dark',
     'encryption_key': '',
+    'api_token': '',
     'muscal_float': True,
     'muscal_float_timeout': 8,
     'muscal_ai_endpoint': '',
@@ -156,6 +158,8 @@ def _regexp(pattern, text):
 
 class Database:
     def __init__(self, path):
+        if str(path) != ':memory:':
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db_path = path
         self.conn = sqlite3.connect(str(path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
@@ -466,11 +470,15 @@ class Database:
 
 
 class AutoTagger:
-    def __init__(self, extra=None):
+    def __init__(self, extra=None, extra_rules=None):
         self.rules = list(AUTO_TAG_RULES)
         if extra:
             for kw in extra:
                 self.rules.append((rf'\b{re.escape(kw)}\b', kw.lower()))
+        if extra_rules:
+            for r in extra_rules:
+                if isinstance(r, (tuple, list)) and len(r) == 2:
+                    self.rules.append(r)
 
     def tag(self, text):
         if not text or len(text) > 50000:
@@ -481,6 +489,54 @@ class AutoTagger:
             if re.search(pat, tlow):
                 tags.add(tag)
         return ','.join(sorted(tags))
+
+
+class PluginManager:
+    """Dynamischer Plugin-Loader für Erweiterungen."""
+
+    def __init__(self, plugin_dir, repo_plugins_dir=None):
+        self.plugin_dir = Path(plugin_dir)
+        self.repo_plugins_dir = Path(repo_plugins_dir) if repo_plugins_dir else None
+        self.plugins = []
+        self.extra_rules = []
+        self.capture_hooks = []
+        self.load_plugins()
+
+    def load_plugins(self):
+        self.plugin_dir.mkdir(parents=True, exist_ok=True)
+        dirs_to_scan = [self.plugin_dir]
+        if self.repo_plugins_dir and self.repo_plugins_dir.exists() and self.repo_plugins_dir != self.plugin_dir:
+            dirs_to_scan.append(self.repo_plugins_dir)
+
+        seen_names = set()
+        for d in dirs_to_scan:
+            for file in sorted(d.glob('*.py')):
+                if file.name.startswith('_') or file.stem in seen_names:
+                    continue
+                seen_names.add(file.stem)
+                try:
+                    spec = importlib.util.spec_from_file_location(file.stem, file)
+                    if spec and spec.loader:
+                        mod = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(mod)
+                        doc = getattr(mod, '__doc__', '').strip()
+                        self.plugins.append({'name': file.name, 'stem': file.stem, 'path': str(file), 'doc': doc})
+                        if hasattr(mod, 'register_rules'):
+                            rules = mod.register_rules()
+                            if isinstance(rules, list):
+                                self.extra_rules.extend(rules)
+                        if hasattr(mod, 'on_capture'):
+                            self.capture_hooks.append(mod.on_capture)
+                        print(f'  ✓ Plugin geladen: {file.name}')
+                except Exception as e:
+                    print(f'  ! Fehler beim Laden von Plugin {file.name}: {e}')
+
+    def on_capture(self, item):
+        for hook in self.capture_hooks:
+            try:
+                hook(item)
+            except Exception as e:
+                print(f'  ! Plugin on_capture Error: {e}')
 
 
 class Encryption:
@@ -531,7 +587,10 @@ class CoolClipboard:
         self.MAX_OVERLAY = self.config.get('max_overlay', 50)
 
         self.db = Database(DB_PATH)
-        self.tagger = AutoTagger()
+        self.plugin_mgr = PluginManager(
+            PLUGIN_DIR,
+            repo_plugins_dir=Path(__file__).parent / 'plugins')
+        self.tagger = AutoTagger(extra_rules=self.plugin_mgr.extra_rules)
         self.crypto = Encryption(self.config.get('encryption_key', ''))
         self.running = True
         self.q = queue.Queue()
@@ -777,6 +836,20 @@ class CoolClipboard:
             self.overlay_list.activate(ni)
             self._update_preview(ni)
 
+    def _paste(self, clip_id):
+        item = self.db.get(clip_id) if clip_id else None
+        if not item:
+            return
+        content = item['content'] or ''
+        if item.get('encrypted') and self.crypto.fernet:
+            content = self.crypto.decrypt(content)
+        if item['type'] == 'text':
+            self._set_clip(content)
+        elif item['type'] == 'image' and item['image_path']:
+            self._set_clip_img(item['image_path'])
+        time.sleep(0.05)
+        self._sim_paste()
+
     def _paste_sel(self):
         if not self.overlay_list:
             return
@@ -911,12 +984,28 @@ class CoolClipboard:
                 return proc.stdout.decode('utf-8', errors='replace')
         except:
             pass
+        try:
+            proc = subprocess.run(
+                ['wl-paste', '--no-newline'],
+                capture_output=True, timeout=0.5)
+            if proc.returncode == 0:
+                return proc.stdout.decode('utf-8', errors='replace')
+        except:
+            pass
         return None
 
     def _get_clip_image(self):
         try:
             proc = subprocess.run(
                 ['xclip', '-selection', 'clipboard', '-t', 'image/png', '-o'],
+                capture_output=True, timeout=0.5)
+            if proc.returncode == 0 and len(proc.stdout) > 50:
+                return proc.stdout
+        except:
+            pass
+        try:
+            proc = subprocess.run(
+                ['wl-paste', '-t', 'image/png'],
                 capture_output=True, timeout=0.5)
             if proc.returncode == 0 and len(proc.stdout) > 50:
                 return proc.stdout
@@ -929,6 +1018,13 @@ class CoolClipboard:
             proc = subprocess.Popen(
                 ['xclip', '-selection', 'clipboard'], stdin=subprocess.PIPE)
             proc.communicate(text.encode('utf-8'))
+            return
+        except:
+            pass
+        try:
+            proc = subprocess.Popen(
+                ['wl-copy'], stdin=subprocess.PIPE)
+            proc.communicate(text.encode('utf-8'))
         except:
             pass
 
@@ -938,6 +1034,16 @@ class CoolClipboard:
                 data = f.read()
             proc = subprocess.Popen(
                 ['xclip', '-selection', 'clipboard', '-t', 'image/png'],
+                stdin=subprocess.PIPE)
+            proc.communicate(data)
+            return
+        except:
+            pass
+        try:
+            with open(path, 'rb') as f:
+                data = f.read()
+            proc = subprocess.Popen(
+                ['wl-copy', '-t', 'image/png'],
                 stdin=subprocess.PIPE)
             proc.communicate(data)
         except:
@@ -968,10 +1074,12 @@ class CoolClipboard:
                         if self.muscal is not None:
                             meta = self.muscal.process_capture(text)
                             if meta is not None:
+                                self.plugin_mgr.on_capture(meta)
                                 self.q.put({'action': 'muscal_capture', 'data': meta})
                         else:
                             tags = self.tagger.tag(text)
-                            self.db.add('text', content=text[:100000], tags=tags)
+                            cid = self.db.add('text', content=text[:100000], tags=tags)
+                            self.plugin_mgr.on_capture({'id': cid, 'content': text, 'tags': tags, 'type': 'text'})
                 else:
                     img = self._get_clip_image()
                     if img:
@@ -1091,6 +1199,15 @@ class CoolClipboard:
         db = self.db
         crypto = self.crypto
 
+        @app.before_request
+        def check_auth():
+            token = self.config.get('api_token', '')
+            if token:
+                auth_hdr = request.headers.get('Authorization', '')
+                provided = auth_hdr[7:].strip() if auth_hdr.startswith('Bearer ') else request.args.get('token', '')
+                if request.path.startswith('/api/') and provided != token:
+                    return jsonify({'error': 'Unauthorized: API token mismatch'}), 401
+
         if self.muscal is not None:
             try:
                 muscal_layer.register_webapp(app, self)
@@ -1100,6 +1217,10 @@ class CoolClipboard:
         @app.route('/')
         def index():
             return HTML_INDEX
+
+        @app.route('/api/plugins', methods=['GET'])
+        def api_plugins():
+            return jsonify({'plugins': self.plugin_mgr.plugins})
 
         @app.route('/api/clips', methods=['GET'])
         def api_list():
@@ -1323,7 +1444,7 @@ class CoolClipboard:
                 return send_file(str(p), mimetype='image/png')
             return '', 404
 
-        app.run(host='127.0.0.1', port=self.WEB_PORT, debug=False)
+        app.run(host=self.config.get('web_host', '0.0.0.0'), port=self.WEB_PORT, debug=False)
 
 # ─── RUN ────────────────────────────────────────────────────
 
@@ -1348,7 +1469,7 @@ class CoolClipboard:
         print(f'  🎨 Theme:    {self.theme_name}')
         print(f'  🔄 Monitor:  active\n')
 
-        if HAS_TK:
+        if HAS_TK and HAS_DISPLAY and hasattr(self, 'root') and self.root:
             self.root.mainloop()
         else:
             try:
@@ -1795,15 +1916,150 @@ if __name__ == '__main__':
                 lines.append(item['content'] or '')
                 lines.append('```')
             lines.append('\n---\n')
-        export_path.write_text('\n'.join(lines))
+        export_path.write_text('\n'.join(lines), encoding='utf-8')
         print(f'  ✓ Exported to: {export_path}')
+        db.close()
+    elif '--export-json' in sys.argv:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        db = Database(DB_PATH)
+        items, total = db.search(pp=999999)
+        export_path = DATA_DIR / f'coolclipboard-export-{datetime.now():%Y%m%d-%H%M%S}.json'
+        export_path.write_text(json.dumps(items, indent=2, ensure_ascii=False), encoding='utf-8')
+        print(BANNER)
+        print(f'  ✓ Exported {total} clips as JSON to: {export_path}')
+        db.close()
+    elif '--export-csv' in sys.argv:
+        import csv
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        db = Database(DB_PATH)
+        items, total = db.search(pp=999999)
+        export_path = DATA_DIR / f'coolclipboard-export-{datetime.now():%Y%m%d-%H%M%S}.csv'
+        with open(export_path, 'w', newline='', encoding='utf-8') as f:
+            if items:
+                writer = csv.DictWriter(f, fieldnames=list(items[0].keys()))
+                writer.writeheader()
+                writer.writerows(items)
+        print(BANNER)
+        print(f'  ✓ Exported {total} clips as CSV to: {export_path}')
+        db.close()
+    elif '--seed' in sys.argv or '--import-samples' in sys.argv:
+        import glob
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        db = Database(DB_PATH)
+        print(BANNER)
+        print('  Importing sample clips from clipboard_tags/...\n')
+        total = 0
+        tag_files = sorted(glob.glob(str(Path(__file__).parent / 'clipboard_tags' / '*.txt')))
+        az = muscal_layer.ContentAnalyzer() if muscal_layer else None
+        store = muscal_layer.CaptureStore(db) if muscal_layer else None
+        if store:
+            store.migrate()
+        tagger = AutoTagger()
+        for f in tag_files:
+            content = Path(f).read_text(encoding='utf-8', errors='replace')
+            entries = []
+            pattern = r'╔[═]+╗\s*║\s*\[(.*?)\]\s*-\s*Tag:\s*([^\n]+)\s*\n╚[═]+╝\s*(.*?)(?=\s*╞[═]+╡|$)'
+            matches = re.findall(pattern, content, re.DOTALL)
+            for ts, tag, text in matches:
+                text = text.strip()
+                if text:
+                    entries.append((ts.strip(), tag.strip(), text))
+            if not entries and 'master' in f:
+                master_pat = r'\[([\d\-:\s]+)\]\s*\[([^\]]+)\]\s*\n(.*?)(?=\n\-+|$)'
+                matches2 = re.findall(master_pat, content, re.DOTALL)
+                for ts, tag, text in matches2:
+                    text = text.strip()
+                    if text:
+                        entries.append((ts.strip(), tag.strip(), text))
+            for ts, tag, text in entries:
+                if store and az:
+                    meta = az.analyze(text, source_app=f'sample:{Path(f).stem}')
+                    if tag and tag not in meta['tags']:
+                        meta['tags'].append(tag)
+                    if store.save(meta):
+                        total += 1
+                else:
+                    tags = tagger.tag(text)
+                    if tag and tag not in tags:
+                        tags = f'{tags},{tag}'.strip(',')
+                    if db.add('text', content=text, tags=tags, source=f'sample:{Path(f).stem}'):
+                        total += 1
+        print(f'  ✓ Successfully imported {total} sample clips into database!\n')
+        db.close()
+    elif '--ask' in sys.argv or '-q' in sys.argv:
+        query_idx = sys.argv.index('--ask') if '--ask' in sys.argv else sys.argv.index('-q')
+        query = ' '.join(sys.argv[query_idx + 1:]).strip() if query_idx + 1 < len(sys.argv) else ''
+        if not query:
+            query = input('Frage an das Clipboard (RAG): ')
+        db = Database(DB_PATH)
+        cfg = load_config()
+        ai = muscal_layer.AiHelper(endpoint=cfg.get('muscal_ai_endpoint', ''),
+                                  api_key=cfg.get('muscal_ai_key', ''),
+                                  model=cfg.get('muscal_ai_model', '')) if muscal_layer else None
+        store = muscal_layer.CaptureStore(db) if muscal_layer else None
+        rag = muscal_layer.RagEngine(store, ai) if muscal_layer and store else None
+        if rag:
+            print(BANNER)
+            print(f'  🧠 RAG-Frage: "{query}"\n')
+            res = rag.query(query)
+            print(res['answer'])
+            print()
+        else:
+            print('RAG engine not available')
+        db.close()
+    elif '--rag-search' in sys.argv:
+        q_idx = sys.argv.index('--rag-search')
+        query = ' '.join(sys.argv[q_idx + 1:]).strip() if q_idx + 1 < len(sys.argv) else ''
+        if not query:
+            query = input('Suchbegriff (Vektorsuche): ')
+        db = Database(DB_PATH)
+        store = muscal_layer.CaptureStore(db) if muscal_layer else None
+        rag = muscal_layer.RagEngine(store, None) if muscal_layer and store else None
+        if rag:
+            print(BANNER)
+            print(f'  🧠 Semantische Vektorsuche für: "{query}"\n')
+            results = rag.retrieve(query, top_k=6)
+            if not results:
+                print('  Keine Treffer gefunden.')
+            for r in results:
+                print(f'  [#{r["id"]} | {int(r["score"]*100)}% Match | {r["category"]}] {r["title"]}')
+                print(f'    {r["content"][:130].strip()}...\n')
+        db.close()
+    elif '--stats' in sys.argv:
+        db = Database(DB_PATH)
+        st = db.get_stats()
+        print(BANNER)
+        print('  📊 CoolClipboard Statistiken:\n')
+        print(f'    Gesamt-Clips:    {st.get("total_clips", 0)}')
+        print(f'    Text-Clips:      {st.get("text_clips", 0)}')
+        print(f'    Bilder:          {st.get("image_clips", 0)}')
+        print(f'    Favoriten:       {st.get("favorites", 0)}')
+        print(f'    Angeheftet:      {st.get("pinned", 0)}')
+        print(f'    Snippets:        {st.get("snippets", 0)}\n')
+        if st.get('top_tags'):
+            print('    Top Tags:')
+            for t, c in st['top_tags'][:8]:
+                print(f'      - {t} ({c}x)')
+            print()
+        if st.get('by_category'):
+            print('    Kategorien:')
+            for cat, count in st['by_category'].items():
+                print(f'      - {cat}: {count}')
+            print()
         db.close()
     elif '--help' in sys.argv or '-h' in sys.argv:
         print(BANNER)
         print('  Usage:')
         print('    python3 coolclipboard.py               Start CoolClipboard')
         print('    python3 coolclipboard.py --install      Install + start')
+        print('    python3 coolclipboard.py --seed         Import sample dataset from clipboard_tags/')
+        print('    python3 coolclipboard.py --ask "query"  Ask RAG question in terminal')
+        print('    python3 coolclipboard.py --rag-search "q" Semantic vector search in terminal')
+        print('    python3 coolclipboard.py --stats        Show clipboard statistics')
         print('    python3 coolclipboard.py --export       Export all clips as markdown')
+        print('    python3 coolclipboard.py --export-json  Export all clips as JSON')
+        print('    python3 coolclipboard.py --export-csv   Export all clips as CSV')
+        print('    python3 coolclipboard.py --selftest     Run automated test suite')
         print('    python3 coolclipboard.py --help         Show this help\n')
         print('  Hotkeys:')
         print(f'    {DEFAULT_CONFIG["hotkey_overlay"]}    Show clipboard history overlay')

@@ -1,12 +1,10 @@
 # Persönliche Daten – nicht hochladen
-~/.local/share/coolclipboard/
 *.db
 *.db.backup-*
 config.json
 images/
 markdown/
 muscal-docs/
-plugins/
 
 # Python
 __pycache__/
