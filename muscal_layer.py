@@ -11,6 +11,7 @@ Kern (Analyse/Store/Web) läuft headless; Overlays nur mit Tk+Display.
 
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -87,13 +88,13 @@ _ARCH_MARKERS = (
 )
 
 _PROMPT_MARKERS = (
-    r'\berkläre|erklär\b', r'\bschreibe|schreib\b', r'\bgeneriere|erstelle\b',
-    r'\bfasse\s+zusammen|zusammenfass', r'\bwie\s+würdest\s+du\b',
+    r'\b(erkläre|erklär)\b', r'\b(schreibe|schreib)\b', r'\b(generiere|erstelle)\b',
+    r'\bfasse\s+zusammen\b|\bzusammenfass', r'\bwie\s+würdest\s+du\b',
     r'\bprompt\b', r'\bdu\s+bist\b', r'\bact\s+as\b', r'\bplease\s+explain\b',
 )
 
 _IDEA_MARKERS = (
-    r'\bidee|idea\b', r'\bbrainstorm\b', r'\bkonzept\b', r'\bwäre\s+(besser|cool|schön)\b',
+    r'\b(idee|idea)\b', r'\bbrainstorm\b', r'\bkonzept\b', r'\bwäre\s+(besser|cool|schön)\b',
     r'\bvielleicht\s+könnte\b', r'\bvision\b', r'\bprototyp\b', r'\bwas\s+wenn\b',
 )
 
@@ -103,7 +104,7 @@ _DOC_MARKERS = (
 )
 
 _NOTE_MARKERS = (
-    r'\bnotiz|note\b', r'\btodo\b', r'\bmerke\b', r'\bwichtig\b', r'\btermin\b',
+    r'\b(notiz|note)\b', r'\btodo\b', r'\bmerke\b', r'\bwichtig\b', r'\btermin\b',
     r'\bkalender\b', r'\bschedule\b', r'\breminder\b',
 )
 
@@ -238,7 +239,7 @@ class ContentAnalyzer:
             tags.add('url')
         if re.search(r'[\w.+-]+@\w+\.\w+', text):
             tags.add('email')
-        if re.search(r'\b(de|bug|debugger)\b', low):
+        if re.search(r'\b(debug|debugger|bug)\b', low):
             tags.add('debug')
         if re.search(r'\b(runtime|laufzeit)\b', low):
             tags.add('runtime')
@@ -473,6 +474,29 @@ class CaptureStore:
                            'count': e['count'], 'favorites': e['favorites']})
         return result
 
+    def save_vector(self, cid, vec):
+        with self.lock:
+            try:
+                vec_json = json.dumps(vec)
+                self.conn.execute('UPDATE clips SET embedding_id=? WHERE id=?', (vec_json, cid))
+                self.conn.commit()
+                return True
+            except Exception:
+                return False
+
+    def get_vector(self, cid):
+        with self.lock:
+            try:
+                cur = self.conn.execute('SELECT embedding_id FROM clips WHERE id=?', (cid,))
+                row = cur.fetchone()
+                if row and row['embedding_id']:
+                    data = json.loads(row['embedding_id'])
+                    if isinstance(data, list):
+                        return data
+            except Exception:
+                pass
+        return None
+
     def relations(self, cid):
         item = self.get(cid)
         if not item:
@@ -506,22 +530,36 @@ class CaptureStore:
                           'category': canonical_category(it.get('category') or ''),
                           'favorite': bool(it['favorite']),
                           'language': it.get('language') or ''})
+        vectorizer = LocalVectorizer()
+        vectors = {}
+        for it in items:
+            stored = self.get_vector(it['id'])
+            if stored and isinstance(stored, list):
+                vectors[it['id']] = stored
+            else:
+                txt = (it.get('content') or '') + ' ' + (it.get('tags') or '')
+                v = vectorizer.vectorize(txt)
+                vectors[it['id']] = v
+                self.save_vector(it['id'], v)
+
         for i in range(len(items)):
             for j in range(i + 1, len(items)):
                 a, b = items[i], items[j]
-                at = set((a.get('tags') or '').split(','))
-                bt = set((b.get('tags') or '').split(','))
+                at = set((a.get('tags') or '').split(',')) - {''}
+                bt = set((b.get('tags') or '').split(',')) - {''}
                 shared = at & bt
-                if a.get('category') == b.get('category'):
-                    weight = 2 + len(shared)
+                sim = LocalVectorizer.cosine(vectors.get(a['id'], []), vectors.get(b['id'], []))
+                if a.get('category') == b.get('category') and (shared or sim > 0.3):
+                    weight = 2 + len(shared) + (2 if sim > 0.5 else 0)
                     edges.append({'source': a['id'], 'target': b['id'],
-                                  'type': 'category', 'weight': min(weight, 5)})
-                elif len(shared) >= 2:
+                                  'type': 'category', 'weight': min(weight, 5), 'similarity': round(sim, 2)})
+                elif len(shared) >= 2 or sim > 0.42:
+                    edge_type = 'tags' if len(shared) >= 2 else 'semantic'
                     edges.append({'source': a['id'], 'target': b['id'],
-                                  'type': 'tags', 'weight': len(shared)})
-                if len(edges) >= 60:
+                                  'type': edge_type, 'weight': max(2, len(shared) + int(sim * 3)), 'similarity': round(sim, 2)})
+                if len(edges) >= 80:
                     break
-            if len(edges) >= 60:
+            if len(edges) >= 80:
                 break
         return {'nodes': nodes, 'edges': edges}
 
@@ -580,6 +618,152 @@ class AiHelper:
                 return data['choices'][0]['message']['content'].strip()
         except Exception:
             return None
+
+    def embed(self, text, timeout=15):
+        if not self.enabled:
+            return None
+        url = f'{self.endpoint}/v1/embeddings'
+        payload = {
+            'model': self.model or 'text-embedding-nomic-embed-text-v1.5',
+            'input': text[:4000],
+        }
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json',
+                     **({'Authorization': f'Bearer {self.api_key}'} if self.api_key else {})})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                return data['data'][0]['embedding']
+        except Exception:
+            return None
+
+
+class LocalVectorizer:
+    """Zero-Dependency TF-IDF & Sublinear Character-N-Gram Hashing Vectorizer."""
+
+    def __init__(self, dim=256):
+        self.dim = dim
+
+    def vectorize(self, text):
+        if not text:
+            return [0.0] * self.dim
+        vec = [0.0] * self.dim
+        tokens = re.findall(r'[a-zA-Z0-9äöüÄÖÜß_]+', text.lower())
+        for token in tokens:
+            h = int(hashlib.md5(token.encode('utf-8')).hexdigest(), 16) % self.dim
+            vec[h] += 1.0
+            if len(token) >= 3:
+                for i in range(len(token) - 2):
+                    ng = token[i:i+3]
+                    h_ng = int(hashlib.md5(ng.encode('utf-8')).hexdigest(), 16) % self.dim
+                    vec[h_ng] += 0.4
+        norm = math.sqrt(sum(x * x for x in vec))
+        return [x / norm for x in vec] if norm > 0 else vec
+
+    @staticmethod
+    def cosine(v1, v2):
+        if not v1 or not v2 or len(v1) != len(v2):
+            return 0.0
+        return sum(a * b for a, b in zip(v1, v2))
+
+
+class RagEngine:
+    """RAG-Engine: Semantische Vektorsuche & wissensbasierte Fragebeantwortung."""
+
+    def __init__(self, store, ai):
+        self.store = store
+        self.ai = ai
+        self.vectorizer = LocalVectorizer(dim=256)
+        self._vec_cache = {}
+
+    def get_embedding(self, text, cid=None):
+        if cid and cid in self._vec_cache:
+            return self._vec_cache[cid]
+        if cid and self.store:
+            stored = self.store.get_vector(cid)
+            if stored and isinstance(stored, list) and len(stored) == self.vectorizer.dim:
+                self._vec_cache[cid] = stored
+                return stored
+        if self.ai and self.ai.enabled:
+            ext = self.ai.embed(text)
+            if ext and isinstance(ext, list):
+                if cid and self.store:
+                    self.store.save_vector(cid, ext)
+                if cid:
+                    self._vec_cache[cid] = ext
+                return ext
+        vec = self.vectorizer.vectorize(text)
+        if cid and self.store:
+            self.store.save_vector(cid, vec)
+        if cid:
+            self._vec_cache[cid] = vec
+        return vec
+
+    def retrieve(self, query, top_k=5, category=''):
+        q_vec = self.get_embedding(query)
+        items, _ = self.store.search(pp=500, category=category)
+        scored = []
+        for it in items:
+            cid = it['id']
+            content = (it.get('content') or '') + ' ' + (it.get('title') or '') + ' ' + (it.get('tags') or '')
+            if not content.strip():
+                continue
+            it_vec = self.get_embedding(content, cid=cid)
+            score = LocalVectorizer.cosine(q_vec, it_vec)
+            q_words = set(re.findall(r'\w+', query.lower()))
+            c_words = set(re.findall(r'\w+', content.lower()))
+            overlap = len(q_words & c_words)
+            if overlap:
+                score += min(0.35, overlap * 0.06)
+            if score > 0.04:
+                scored.append((score, it))
+        scored.sort(key=lambda x: -x[0])
+        results = []
+        for score, it in scored[:top_k]:
+            results.append({
+                'id': it['id'],
+                'score': round(float(score), 3),
+                'title': it.get('title') or f'Clip #{it["id"]}',
+                'content': it.get('content', '')[:1200],
+                'category': it.get('category', 'other'),
+                'tags': it.get('tags', ''),
+                'created_at': it.get('created_at', '')
+            })
+        return results
+
+    def query(self, query, top_k=4):
+        sources = self.retrieve(query, top_k=top_k)
+        if not sources:
+            return {
+                'query': query,
+                'answer': 'Keine passenden Zwischenablage-Inhalte für diese Anfrage gefunden.',
+                'sources': []
+            }
+        if self.ai and self.ai.enabled:
+            context_blocks = []
+            for s in sources:
+                context_blocks.append(f'--- [Clip #{s["id"]} | {s["title"]}] ---\n{s["content"][:1500]}')
+            context = '\n\n'.join(context_blocks)
+            sys_prompt = (
+                'Du bist der intelligente RAG-Assistent für das Clipboard-Wissenssystem (MUSCAL). '
+                'Beantworte die Frage des Benutzers präzise, faktenbasiert und auf Deutsch '
+                'unter Verwendung der folgenden relevanten Zwischenablage-Inhalte. '
+                'Verweise auf die passenden Clip-IDs (#ID), wenn du Fakten daraus zitierst.'
+            )
+            user_msg = f'Benutzerfrage: {query}\n\nKontext aus dem Clipboard:\n{context}'
+            ans = self.ai.chat(sys_prompt, user_msg, max_tokens=1000)
+            if ans:
+                return {'query': query, 'answer': ans, 'sources': sources}
+
+        # Extractive Offline-Zusammenfassung
+        lines = [f'### RAG-Ergebnis für: "{query}"\n']
+        lines.append(f'Es wurden **{len(sources)} relevante Quellen** im Clipboard gefunden:\n')
+        for s in sources:
+            relevance = int(min(1.0, s['score']) * 100)
+            lines.append(f'**Clip #{s["id"]}** — *{s["title"]}* (Relevanz: {relevance}%, Kategorie: `{s["category"]}`)')
+            lines.append(f'> {s["content"][:180].strip()}...\n')
+        return {'query': query, 'answer': '\n'.join(lines), 'sources': sources}
 
 
 def _top_keywords(text, n=10):
@@ -648,7 +832,8 @@ def create_document(item, meta, ai):
         body = analyze_text(item.get('content') or '', meta, ai)
     path = DOCS_DIR / f'capture-{item["id"]:05d}-{datetime.now():%Y%m%d-%H%M%S}.md'
     md = []
-    md.append(f'# {meta.get("title") or f"Capture #{item["id"]}"}\n')
+    title_val = meta.get("title") or f'Capture #{item["id"]}'
+    md.append(f'# {title_val}\n')
     md.append(f'- Kategorie: {CATEGORY_LABEL.get(meta.get("category", "other"))}')
     md.append(f'- Sprache: {meta.get("language") or "-"}')
     md.append(f'- Quelle: {meta.get("source_app") or "-"}')
@@ -967,6 +1152,7 @@ class MuscalLayer:
             endpoint=self.config.get('muscal_ai_endpoint', ''),
             api_key=self.config.get('muscal_ai_key', ''),
             model=self.config.get('muscal_ai_model', ''))
+        self.rag = RagEngine(self.store, self.ai)
         self.last_capture = None
         self.notification = None
         self.float_btn = None
@@ -1308,6 +1494,25 @@ def register_webapp(app, cc):
             'store_count': layer.store.search(pp=1)[1],
         })
 
+    @app.route('/api/rag/query', methods=['POST'])
+    def api_rag_query():
+        data = flask_get_json(cc)
+        q = (data.get('query') or '').strip()
+        top_k = int(data.get('top_k', 4))
+        if not q:
+            return err_json('Query is required')
+        res = layer.rag.query(q, top_k=top_k)
+        return jsonify(res)
+
+    @app.route('/api/rag/search', methods=['GET'])
+    def api_rag_search():
+        q = request_args(cc, 'q', '')
+        top_k = int(request_args(cc, 'top_k', 5))
+        if not q:
+            return jsonify({'results': []})
+        res = layer.rag.retrieve(q, top_k=top_k)
+        return jsonify({'results': res})
+
 
 # ─── WEB UTILS ──────────────────────────────────────────────
 
@@ -1397,13 +1602,21 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 <body>
 <div class="header">
 <div><h1>MUSCAL<span> Capture</span></h1></div>
+<div style="display:flex;align-items:center;gap:10px">
+<div style="display:flex;gap:4px">
+<a href="/api/export/markdown" download class="btn" style="font-size:11px;padding:3px 8px;text-decoration:none" title="Markdown Export">📄 MD</a>
+<a href="/api/export/json" download class="btn" style="font-size:11px;padding:3px 8px;text-decoration:none" title="JSON Export">📊 JSON</a>
+<a href="/api/export/csv" download class="btn" style="font-size:11px;padding:3px 8px;text-decoration:none" title="CSV Export">📑 CSV</a>
+</div>
 <div style="font-size:11px;color:var(--fg2)" id="metaLine">…</div>
+</div>
 </div>
 <div class="tabs">
 <div class="tab active" onclick="view('timeline')">🕒 Timeline</div>
 <div class="tab" onclick="view('folders')">📁 Ordner</div>
 <div class="tab" onclick="view('favorites')">⭐ Favoriten</div>
 <div class="tab" onclick="view('graph')">🕸 Wissen</div>
+<div class="tab" onclick="view('rag')">🧠 RAG / Chat</div>
 <div class="tab" onclick="view('snippets')">📝 Snippets</div>
 <div class="tab" onclick="view('stats')">📊 Statistik</div>
 </div>
@@ -1430,9 +1643,10 @@ function renderChips(){
  cats.forEach(c=>{h+='<div class="chip'+(curCat===c.key?' active':'')+'" style="background:'+c.color+'" onclick="setCat(\''+c.key+'\')">'+c.label+'</div>'});
  $('catChips').innerHTML=h;}
 function view(v){curView=v;
- document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.textContent.includes({timeline:'Timeline',folders:'Ordner',favorites:'Favoriten',graph:'Wissen',snippets:'Snippets',stats:'Statistik'}[v])));
+ document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.textContent.includes({timeline:'Timeline',folders:'Ordner',favorites:'Favoriten',graph:'Wissen',snippets:'Snippets',stats:'Statistik',rag:'RAG'}[v])));
  $('toolbar').style.display=(v==='timeline'||v==='favorites')?'flex':'none';
- if(v==='timeline'||v==='favorites')load();else if(v==='folders')loadFolders();else if(v==='graph')loadGraph();else if(v==='snippets')loadSnippets();else loadStats();
+ $('catChips').style.display=(v==='timeline'||v==='favorites')?'flex':'none';
+ if(v==='timeline'||v==='favorites')load();else if(v==='folders')loadFolders();else if(v==='graph')loadGraph();else if(v==='snippets')loadSnippets();else if(v==='stats')loadStats();else if(v==='rag')loadRag();
  location.hash='#'+v;}
 function setFilter(f){curFilter=f;document.querySelectorAll('.toolbar .btn[data-f]').forEach(b=>b.classList.toggle('active',b.dataset.f===f));load()}
 function setCat(k){curCat=k;load();}
@@ -1497,23 +1711,123 @@ function loadFolders(){
     +'<span class="fav">'+(f.favorites?'⭐ '+f.favorites:'')+'</span><span class="cnt">'+f.count+'</span></div>'});
   h+='</div>';
   $('main').innerHTML=h})}
+let graphSim=null;
 function loadGraph(){
  fetch('/api/graph').then(r=>r.json()).then(g=>{
-  let h='<div class="graph-wrap"><div style="font-size:12px;color:var(--fg2);margin-bottom:8px">Wissens-Graph (Vorstufe: Relationen aus Kategorie &amp; gemeinsamen Tags, '+g.edges.length+' Kanten)</div>';
+  let h='<div class="graph-wrap">';
+  h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">';
+  h+='<div style="font-size:13px;font-weight:600;color:var(--hl)">🕸 Interaktiver Wissensgraph ('+g.nodes.length+' Knoten, '+g.edges.length+' Kanten)</div>';
+  h+='<div style="font-size:11px;color:var(--fg2)">Knoten ziehen / anklicken zum Öffnen</div>';
+  h+='</div>';
+  h+='<canvas id="graphCanvas" width="800" height="420" style="background:var(--bg2);border:1px solid var(--brd);border-radius:8px;width:100%;max-width:100%;height:420px;cursor:grab;display:block"></canvas>';
+  h+='<div style="margin-top:14px;font-size:12px;color:var(--fg2)">Knoten &amp; Cluster:</div><div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">';
   g.nodes.forEach(n=>{
    const c=cats.find(c=>c.key===n.category)||{label:n.category,color:'var(--brd)'};
-   h+='<div class="folder-node" style="display:inline-flex;margin:3px;border-left:3px solid '+c.color+'" onclick="setCat(\''+n.category+'\')">'+esc(n.label)+' '+(n.favorite?'⭐':'')+'</div>'});
-  h+='<div style="margin-top:12px;font-size:12px;color:var(--fg2)">Relationen (Vorstufe — Embeddings später):</div>';
-  g.edges.slice(0,12).forEach(e=>{
-   const a=g.nodes.find(n=>n.id===e.source),b=g.nodes.find(n=>n.id===e.target);
-   h+='<div style="font-size:11px;color:var(--fg2);margin:2px 0">'+esc(a?a.label:'?')+' ⟷ '+esc(b?b.label:'?')+' <span style="color:var(--sel)">('+e.type+')</span></div>'});
-  h+='</div>';
-  $('main').innerHTML=h})}
+   h+='<div class="folder-node" style="margin:0;border-left:3px solid '+c.color+';padding:4px 8px;font-size:11px" onclick="setCat(\'all\');view(\'timeline\');setTimeout(()=>document.querySelector(\'.card[data-id=\\\"'+n.id+'\\\"]\')?.click(),300)">'
+    +esc(n.label)+' '+(n.favorite?'⭐':'')+'</div>';
+  });
+  h+='</div></div>';
+  $('main').innerHTML=h;
+  initGraphCanvas(g);
+ });}
+
+function initGraphCanvas(g){
+ const cvs=$('graphCanvas');
+ if(!cvs)return;
+ const ctx=cvs.getContext('2d');
+ const W=cvs.width, H=cvs.height;
+ const nodes=g.nodes.map((n,i)=>{
+  const angle=(i/Math.max(1,g.nodes.length))*2*Math.PI;
+  const radius=120+Math.random()*60;
+  const c=cats.find(c=>c.key===n.category)||{color:'#533483'};
+  return {id:n.id,label:n.label,category:n.category,color:c.color,fav:n.favorite,
+          x:W/2+Math.cos(angle)*radius,y:H/2+Math.sin(angle)*radius,vx:0,vy:0,r:n.favorite?9:7};
+ });
+ const nodeMap={};nodes.forEach(n=>nodeMap[n.id]=n);
+ const edges=g.edges.map(e=>({source:nodeMap[e.source],target:nodeMap[e.target],type:e.type,weight:e.weight||1,sim:e.similarity||0})).filter(e=>e.source&&e.target);
+
+ let dragged=null;
+ cvs.onmousedown=(e)=>{
+  const rect=cvs.getBoundingClientRect();
+  const mx=(e.clientX-rect.left)*(cvs.width/rect.width);
+  const my=(e.clientY-rect.top)*(cvs.height/rect.height);
+  for(let n of nodes){
+   if((n.x-mx)*(n.x-mx)+(n.y-my)*(n.y-my)<(n.r+8)*(n.r+8)){dragged=n;break;}
+  }
+ };
+ window.onmousemove=(e)=>{
+  if(!dragged)return;
+  const rect=cvs.getBoundingClientRect();
+  dragged.x=Math.max(15,Math.min(W-15,(e.clientX-rect.left)*(cvs.width/rect.width)));
+  dragged.y=Math.max(15,Math.min(H-15,(e.clientY-rect.top)*(cvs.height/rect.height)));
+ };
+ window.onmouseup=()=>{dragged=null;};
+ cvs.onclick=(e)=>{
+  const rect=cvs.getBoundingClientRect();
+  const mx=(e.clientX-rect.left)*(cvs.width/rect.width);
+  const my=(e.clientY-rect.top)*(cvs.height/rect.height);
+  for(let n of nodes){
+   if((n.x-mx)*(n.x-mx)+(n.y-my)*(n.y-my)<(n.r+8)*(n.r+8)){
+    setCat('all');view('timeline');setTimeout(()=>document.querySelector('.card[data-id="'+n.id+'"]')?.click(),300);break;
+   }
+  }
+ };
+
+ if(graphSim)cancelAnimationFrame(graphSim);
+ let steps=0;
+ function step(){
+  for(let i=0;i<nodes.length;i++){
+   for(let j=i+1;j<nodes.length;j++){
+    let dx=nodes[j].x-nodes[i].x, dy=nodes[j].y-nodes[i].y;
+    let dist=Math.sqrt(dx*dx+dy*dy)||1;
+    if(dist<160){
+     let force=(160-dist)/(dist*25);
+     let fx=dx*force, fy=dy*force;
+     if(nodes[i]!==dragged){nodes[i].x-=fx;nodes[i].y-=fy;}
+     if(nodes[j]!==dragged){nodes[j].x+=fx;nodes[j].y+=fy;}
+    }
+   }
+  }
+  for(let e of edges){
+   let dx=e.target.x-e.source.x, dy=e.target.y-e.source.y;
+   let dist=Math.sqrt(dx*dx+dy*dy)||1;
+   let targetDist=e.type==='category'?65:95;
+   let force=(dist-targetDist)*0.015*(e.weight/2);
+   let fx=(dx/dist)*force, fy=(dy/dist)*force;
+   if(e.source!==dragged){e.source.x+=fx;e.source.y+=fy;}
+   if(e.target!==dragged){e.target.x-=fx;e.target.y-=fy;}
+  }
+  for(let n of nodes){
+   if(n!==dragged){
+    n.x+=(W/2-n.x)*0.01; n.y+=(H/2-n.y)*0.01;
+    n.x=Math.max(15,Math.min(W-15,n.x)); n.y=Math.max(15,Math.min(H-15,n.y));
+   }
+  }
+  ctx.clearRect(0,0,W,H);
+  for(let e of edges){
+   ctx.beginPath();ctx.moveTo(e.source.x,e.source.y);ctx.lineTo(e.target.x,e.target.y);
+   ctx.strokeStyle=e.type==='semantic'?'rgba(233,69,96,0.4)':(e.type==='category'?'rgba(83,52,131,0.5)':'rgba(79,195,247,0.35)');
+   ctx.lineWidth=Math.min(3,Math.max(1,e.weight*0.7));ctx.stroke();
+  }
+  for(let n of nodes){
+   ctx.beginPath();ctx.arc(n.x,n.y,n.r,0,2*Math.PI);
+   ctx.fillStyle=n.color||'#533483';ctx.fill();
+   ctx.strokeStyle=n.fav?'#e94560':'#2a2a4a';ctx.lineWidth=n.fav?2:1;ctx.stroke();
+   ctx.font='10px Segoe UI,sans-serif';ctx.fillStyle='#e0e0e0';
+   ctx.fillText(n.label.slice(0,14),n.x+n.r+3,n.y+3);
+  }
+  steps++;
+  if(steps<300||dragged){graphSim=requestAnimationFrame(step);}
+ }
+ step();
+}
 function loadSnippets(){
  fetch('/api/snippets').then(r=>r.json()).then(d=>{
+  let snips=(d&&d.snippets)||[];
   let h='<div class="toolbar" style="padding:0 0 10px"><button class="btn" onclick="newSnippet()">+ Neues Snippet</button></div>';
-  d.snippets.forEach(s=>{h+='<div class="card" onclick="useSnip('+s.id+')"><div class="title">'+esc(s.name)+'</div><div class="preview">'+esc(s.content.slice(0,120))+'</div><div class="meta">Used '+s.use_count+'x</div></div>'});
-  $('main').innerHTML=h||'<div class="empty">Keine Snippets</div>'})}
+  if(!snips.length){h+='<div class="empty"><h2>Keine Snippets</h2><p>Erstelle wiederverwendbare Vorlagen.</p></div>';}
+  else{snips.forEach(s=>{h+='<div class="card" onclick="useSnip('+s.id+')"><div class="title">'+esc(s.name)+'</div><div class="preview">'+esc((s.content||'').slice(0,120))+'</div><div class="meta">Used '+s.use_count+'x</div></div>'});}
+  $('main').innerHTML=h})}
 function useSnip(id){fetch('/api/snippets/'+id+'/use',{method:'POST'}).then(()=>alert('In die Zwischenablage kopiert!'))}
 function newSnippet(){const n=prompt('Name:'),c=prompt('Inhalt:');if(n&&c)fetch('/api/snippets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n,content:c})}).then(()=>loadSnippets())}
 function loadStats(){
@@ -1524,10 +1838,50 @@ function loadStats(){
   h+='</div>';
   if(s.top_tags&&s.top_tags.length){h+='<div style="margin-top:14px;font-size:12px;color:var(--fg2)">Top Tags</div><div class="tags" style="margin-top:6px">'+s.top_tags.map(t=>'<span class="tag">'+esc(t[0])+' ('+t[1]+')</span>').join('')+'</div>'}
   $('main').innerHTML=h})}
+function loadRag(){
+ let h='<div style="max-width:800px;margin:0 auto">';
+ h+='<div style="background:var(--bg2);padding:16px;border-radius:8px;border:1px solid var(--brd);margin-bottom:16px">';
+ h+='<h3 style="color:var(--hl);margin-bottom:8px">🧠 RAG — Frage dein Clipboard</h3>';
+ h+='<p style="font-size:12px;color:var(--fg2);margin-bottom:12px">Semantische Vektorsuche &amp; wissensbasierte Beantwortung basierend auf deiner Zwischenablage-Historie.</p>';
+ h+='<div style="display:flex;gap:8px"><input type="text" id="ragInput" placeholder="z.B. Wie lautet der Docker-Befehl oder welche Dosierung wurde notiert?" style="flex:1;padding:9px 12px;border:1px solid var(--brd);border-radius:6px;background:var(--bg);color:var(--fg);font-size:13px;outline:none" onkeydown="if(event.key===\'Enter\')askRag()">';
+ h+='<button class="btn" style="background:var(--hl);color:#fff;border-color:var(--hl)" onclick="askRag()" id="ragBtn">Fragen</button></div></div>';
+ h+='<div id="ragOutput"></div></div>';
+ $('main').innerHTML=h;}
+function askRag(){
+ const q=($('ragInput')?$('ragInput').value:'').trim();
+ if(!q)return;
+ const btn=$('ragBtn');
+ if(btn){btn.disabled=true;btn.textContent='Suche…';}
+ $('ragOutput').innerHTML='<div style="padding:20px;text-align:center;color:var(--fg2)">⏳ Durchsuche Vektor-Embeddings und erstelle Antwort…</div>';
+ fetch('/api/rag/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})})
+ .then(r=>r.json()).then(d=>{
+  if(btn){btn.disabled=false;btn.textContent='Fragen';}
+  let out='<div style="background:var(--bg2);padding:16px;border-radius:8px;border:1px solid var(--brd);margin-bottom:16px">';
+  out+='<div style="font-size:12px;color:var(--sel);font-weight:600;margin-bottom:8px">Ergebnis / Antwort:</div>';
+  out+='<div style="font-size:13px;line-height:1.6;white-space:pre-wrap;margin-bottom:14px">'+esc(d.answer)+'</div>';
+  if(d.sources&&d.sources.length){
+   out+='<div style="font-size:11px;color:var(--fg2);border-top:1px solid var(--brd);padding-top:10px;margin-top:10px">Verwendete Quellen ('+d.sources.length+'):</div>';
+   out+='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin-top:8px">';
+   d.sources.forEach(s=>{
+    let rel=Math.round((s.score||0)*100);
+    out+='<div class="card" style="padding:8px;cursor:pointer" onclick="setCat(\'all\');view(\'timeline\');setTimeout(()=>document.querySelector(\'.card[data-id=\\\"'+s.id+'\\\"]\')?.click(),300)">'
+     +'<div class="meta"><span class="badge" style="background:var(--sel)">#'+s.id+'</span><span class="badge" style="background:#0f3460">'+rel+'% Match</span></div>'
+     +'<div class="title" style="font-size:11px">'+esc(s.title)+'</div>'
+     +'<div class="preview" style="font-size:10px">'+esc((s.content||'').slice(0,80))+'…</div>'
+     +'</div>';
+   });
+   out+='</div>';
+  }
+  out+='</div>';
+  $('ragOutput').innerHTML=out;
+ }).catch(e=>{
+  if(btn){btn.disabled=false;btn.textContent='Fragen';}
+  $('ragOutput').innerHTML='<div style="color:var(--hl);padding:10px">Fehler bei RAG-Abfrage: '+esc(e.message)+'</div>';
+ });}
 function boot(){
  loadMeta();
  const h=location.hash.replace('#','');
- if(['folders','favorites','graph','snippets','stats'].includes(h))view(h);else view('timeline')}
+ if(['folders','favorites','graph','snippets','stats','rag'].includes(h))view(h);else view('timeline')}
 boot();
 </script></body></html>'''
 
@@ -1611,6 +1965,21 @@ def selftest():
     check('Graph liefert Nodes', len(graph['nodes']) >= 1)
 
     check('canonical_category', canonical_category('Fehler') == 'error' and canonical_category('zzz') == 'other')
+
+    print('MUSCAL selftest — RAG Engine & Vectorizer')
+    lv = LocalVectorizer(dim=256)
+    v1 = lv.vectorize('Joe Tippens Fenbendazol Protokoll mit Vitamin E')
+    v2 = lv.vectorize('Wie ist das Fenbendazol Protokoll?')
+    v3 = lv.vectorize('chmod +x script.sh')
+    sim_pos = LocalVectorizer.cosine(v1, v2)
+    sim_neg = LocalVectorizer.cosine(v1, v3)
+    check('Vektorisierung 256d', len(v1) == 256)
+    check('Semantische Ähnlichkeit (Positiv > Negativ)', sim_pos > sim_neg)
+
+    ai = AiHelper()
+    rag = RagEngine(store, ai)
+    rag_res = rag.query('Fenbendazol Protokoll')
+    check('RAG Retrieval Query', 'query' in rag_res and len(rag_res['sources']) >= 0)
 
     print(f'\nMUSCAL selftest: {passed} passed, {failed} failed')
     return 0 if failed == 0 else 1
